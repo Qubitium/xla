@@ -58,6 +58,11 @@ absl::StatusOr<std::vector<CodegenOrchestrator::Config>>
 CodegenOrchestrator::GetSupportedConfigs(const HloInstruction& instr) const {
   std::vector<Config> configs;
   for (auto& codegen_backend : codegen_backends_) {
+    if (!IsBackendAllowed(instr, codegen_backend->backend())) {
+      VLOG(3) << "Skipping disallowed backend " << codegen_backend->name()
+              << " for HLO " << instr.name();
+      continue;
+    }
     absl::StatusOr<std::vector<std::unique_ptr<BackendConfig>>>
         per_backend_configs = codegen_backend->GetSupportedConfigs(instr);
     if (!per_backend_configs.ok()) {
@@ -78,6 +83,11 @@ CodegenOrchestrator::GetSupportedConfigs(const HloInstruction& instr) const {
 absl::StatusOr<CodegenOrchestrator::Config>
 CodegenOrchestrator::GetDefaultConfig(const HloInstruction& instr) const {
   for (auto& backend : codegen_backends_) {
+    if (!IsBackendAllowed(instr, backend->backend())) {
+      VLOG(3) << "Skipping disallowed backend " << backend->name()
+              << " for HLO " << instr.name();
+      continue;
+    }
     auto config = backend->GetDefaultConfig(instr);
     if (config.ok()) {
       return Config{backend.get(), std::move(*config)};
@@ -90,6 +100,11 @@ CodegenOrchestrator::GetDefaultConfig(const HloInstruction& instr) const {
 
 absl::StatusOr<std::unique_ptr<Executable>> CodegenOrchestrator::Compile(
     const HloInstruction& instr, const Config& config) const {
+  if (!IsBackendAllowed(instr, config.codegen_backend->backend())) {
+    return absl::PermissionDeniedError(absl::StrCat(
+        "Backend-selection policy disallows config ", config.ToString(),
+        " for HLO ", instr.name()));
+  }
   if (options_.exclude_cublas_config &&
       (config.codegen_backend->backend() ==
            autotuner::Backend::CUBLASLT_FISSION ||
@@ -131,7 +146,18 @@ CodegenOrchestrator::CompileAll(const HloInstruction& instr,
 
 absl::Status CodegenOrchestrator::ApplyConfig(HloInstruction& instr,
                                               const Config& config) const {
+  if (!IsBackendAllowed(instr, config.codegen_backend->backend())) {
+    return absl::PermissionDeniedError(absl::StrCat(
+        "Backend-selection policy disallows config ", config.ToString(),
+        " for HLO ", instr.name()));
+  }
   return config.codegen_backend->ApplyConfig(instr, *config.backend_config);
+}
+
+bool CodegenOrchestrator::IsBackendAllowed(
+    const HloInstruction& instr, autotuner::Backend backend) const {
+  return !options_.allow_backend_fn ||
+         options_.allow_backend_fn(instr, backend);
 }
 
 absl::Status CodegenOrchestrator::IsValidExecutable(
