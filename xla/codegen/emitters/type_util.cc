@@ -58,7 +58,8 @@ mlir::Type TensorShapeToMlirType(const Shape& shape, mlir::OpBuilder& b) {
   // Default layouts create a lot of clutter in the IR, so only add an
   // encoding when needed.
   mlir::Attribute layout = {};
-  if (!LayoutUtil::IsMonotonicWithDim0Major(shape.layout())) {
+  if (shape.has_layout() &&
+      !LayoutUtil::IsMonotonicWithDim0Major(shape.layout())) {
     layout = CreateDenseIntElementsAttrFromVector(
         llvm::to_vector(shape.layout().minor_to_major()), b);
   }
