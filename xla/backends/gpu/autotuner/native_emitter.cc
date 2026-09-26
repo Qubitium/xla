@@ -42,6 +42,66 @@ limitations under the License.
 namespace xla::gpu {
 namespace {
 
+// Returns true for the square-sum reduction fusion produced by RMSNorm:
+ // low-precision/F32 activation -> F32 square -> reduce over the final hidden
+ // dimension. Fusion formation can split the rsqrt/scale consumers away, so
+ // this reduction is the stable structural anchor.
+bool IsRmsNormReductionFusion(const HloInstruction& instr) {
+  if (instr.opcode() != HloOpcode::kFusion) {
+    return false;
+  }
+
+  const auto* fusion = Cast<const HloFusionInstruction>(&instr);
+  const HloComputation* computation =
+      fusion->fused_instructions_computation();
+  if (computation == nullptr) {
+    return false;
+  }
+
+  for (const HloInstruction* op : computation->instructions()) {
+    if (op->opcode() != HloOpcode::kReduce || op->operand_count() < 1 ||
+        op->shape().element_type() != PrimitiveType::F32 ||
+        op->operand(0)->opcode() != HloOpcode::kMultiply) {
+      continue;
+    }
+
+    const HloInstruction* square = op->operand(0);
+    if (square->operand_count() != 2 ||
+        square->operand(0) != square->operand(1)) {
+      continue;
+    }
+
+    const HloInstruction* square_input = square->operand(0);
+    const HloInstruction* activation = square_input;
+    if (square_input->opcode() == HloOpcode::kConvert) {
+      if (square_input->operand_count() != 1 ||
+          square_input->shape().element_type() != PrimitiveType::F32) {
+        continue;
+      }
+      activation = square_input->operand(0);
+    }
+
+    if (!activation->shape().IsArray() ||
+        activation->shape().dimensions_size() < 1 ||
+        (activation->shape().element_type() != PrimitiveType::F16 &&
+         activation->shape().element_type() != PrimitiveType::BF16 &&
+         activation->shape().element_type() != PrimitiveType::F32) ||
+        square_input->shape().element_type() != PrimitiveType::F32 ||
+        square_input->shape().dimensions_size() !=
+            activation->shape().dimensions_size()) {
+      continue;
+    }
+
+    const int64_t hidden_axis = activation->shape().dimensions_size() - 1;
+    for (int64_t dimension : op->dimensions()) {
+      if (dimension == hidden_axis) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 llvm::SmallSet<int64_t, 4> ComputeUnrollFactors(
     const HloInstruction& instr, int64_t default_unroll_factor,
     const se::DeviceDescription& device_description) {
@@ -77,7 +137,8 @@ bool NativeEmitterBackend::IsSupported(const HloInstruction& instr) {
     return false;
   }
   auto fusion = Cast<HloFusionInstruction>(&instr);
-  return fusion->fusion_kind() != HloInstruction::FusionKind::kCustom;
+  return fusion->fusion_kind() != HloInstruction::FusionKind::kCustom &&
+         !IsRmsNormReductionFusion(instr);
 }
 
 absl::StatusOr<std::vector<std::unique_ptr<BackendConfig>>>
@@ -114,6 +175,10 @@ NativeEmitterBackend::GetSupportedConfigs(const HloInstruction& instr) {
 
 absl::StatusOr<std::unique_ptr<BackendConfig>>
 NativeEmitterBackend::GetDefaultConfig(const HloInstruction& instr) {
+  if (IsRmsNormReductionFusion(instr)) {
+    return absl::NotFoundError(
+        "NativeEmitter is disabled for RMSNorm reduction fusions.");
+  }
   auto config = std::make_unique<BackendConfig>();
   NativeEmitterBackendConfig* native_emitter_config =
       config->mutable_native_emitter();
