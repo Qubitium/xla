@@ -44,11 +44,6 @@ class CodegenOrchestrator {
     // TODO(b/519059655): Generalize and move to tuner.
     // If true, do not allow compilation of cublas or rocblas configs.
     bool exclude_cublas_config = false;
-    // Additional per-instruction backend policy. Applied to candidate
-    // enumeration, defaults, compilation/application, and cached configs.
-    std::function<bool(const HloInstruction&, autotuner::Backend)>
-        allow_backend_fn =
-            [](const HloInstruction&, autotuner::Backend) { return true; };
   };
 
   // TODO(b/444398084): Unify Cache::Config and CodegenOrchestrator::Config
@@ -92,9 +87,6 @@ class CodegenOrchestrator {
   const std::vector<std::unique_ptr<CodegenBackend>>& codegen_backends() const {
     return codegen_backends_;
   }
-
-  bool IsBackendAllowed(const HloInstruction& instr,
-                        autotuner::Backend backend) const;
 
  private:
   CodegenOrchestrator(
