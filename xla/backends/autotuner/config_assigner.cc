@@ -432,6 +432,14 @@ std::optional<ConfigAssigner::Config> ConfigAssigner::LookUp(
   if (!cached_config.has_value()) {
     return std::nullopt;
   }
+  if (!orchestrator_->IsBackendAllowed(*instr,
+                                       cached_config->codegen_backend)) {
+    LOG(WARNING) << "Ignoring cached config from backend "
+                 << Backend_Name(cached_config->codegen_backend)
+                 << " for HLO '" << instr->ToString()
+                 << "' because the backend-selection policy disallows it.";
+    return std::nullopt;
+  }
   VLOG(1) << "Found cached config for HLO: " << instr->ToString();
   for (const auto& codegen_backend : orchestrator_->codegen_backends()) {
     if (codegen_backend->backend() == cached_config->codegen_backend) {
