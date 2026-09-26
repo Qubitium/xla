@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/backends/gpu/autotuner/native_emitter.h"
 
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <gmock/gmock.h>
@@ -23,6 +24,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_replace.h"
 #include "absl/strings/substitute.h"
 #include "xla/backends/autotuner/codegen_backend.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -84,7 +86,8 @@ HloModule deepseek_v41_rmsnorm
   %hidden_f32 = f32[1,1,5120]{2,1,0} convert(%hidden)
   %square = f32[1,1,5120]{2,1,0} multiply(%hidden_f32, %hidden_f32)
   %zero = f32[] constant(0)
-  %sum = f32[1,1]{1,0} reduce(%square, %zero), dimensions={2}, to_apply=%add
+  %sum = f32[1,1]{1,0} reduce(%square, %zero), dimensions={2}, to_apply=%add,
+    frontend_attributes={zml.rms_norm_reduction="1"}
   %mean_scale = f32[] constant(0.0001953125)
   %mean_scale_b = f32[1,1]{1,0} broadcast(%mean_scale), dimensions={}
   %mean = f32[1,1]{1,0} multiply(%sum, %mean_scale_b)
@@ -168,7 +171,8 @@ HloModule tuple_split_rmsnorm
   %hidden_f32 = f32[1,1,5120]{2,1,0} convert(%hidden)
   %square = f32[1,1,5120]{2,1,0} multiply(%hidden_f32, %hidden_f32)
   %zero = f32[] constant(0)
-  %sum = f32[1,1]{1,0} reduce(%square, %zero), dimensions={2}, to_apply=%add
+  %sum = f32[1,1]{1,0} reduce(%square, %zero), dimensions={2}, to_apply=%add,
+    frontend_attributes={zml.rms_norm_reduction="1"}
   ROOT %tuple = (f32[1,1]{1,0}, bf16[1,1,5120]{2,1,0}) tuple(%sum, %hidden)
 }
 
@@ -358,6 +362,22 @@ TEST_F(NativeEmitterBackendTest, RejectsDeepSeekV41RmsNorm) {
   EXPECT_TRUE(configs.empty());
   EXPECT_THAT(backend_.GetDefaultConfig(*fusion),
               absl_testing::StatusIs(absl::StatusCode::kNotFound));
+
+  BackendConfig stale_config;
+  stale_config.mutable_native_emitter();
+  EXPECT_THAT(backend_.ApplyConfig(*fusion, stale_config),
+              absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition));
+}
+
+TEST_F(NativeEmitterBackendTest, AllowsIdenticalUntaggedRmsNormGraph) {
+  std::string untagged = absl::StrReplaceAll(
+      kDeepSeekV41RmsNormHlo,
+      {{",\n    frontend_attributes={zml.rms_norm_reduction=\"1\"}", ""}});
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(untagged));
+  auto* fusion = module->entry_computation()->root_instruction();
+  ASSERT_OK_AND_ASSIGN(auto configs, backend_.GetSupportedConfigs(*fusion));
+  ASSERT_EQ(configs.size(), 1);
+  EXPECT_TRUE(configs[0]->has_native_emitter());
 }
 
 TEST_F(NativeEmitterBackendTest, AllowsNonRmsNorm5120Reduction) {
