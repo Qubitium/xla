@@ -17,7 +17,6 @@ limitations under the License.
 
 #include <cstdint>
 #include <memory>
-#include <utility>
 #include <vector>
 
 #include "absl/log/log.h"
@@ -28,6 +27,7 @@ limitations under the License.
 #include "xla/autotuning.pb.h"
 #include "xla/backends/autotuner/codegen_backend.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
+#include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
@@ -41,6 +41,30 @@ limitations under the License.
 
 namespace xla::gpu {
 namespace {
+
+// ZML marks only the reduction that computes an RMSNorm mean square. Match
+// the semantic marker, not its arithmetic: L2 norms and variances can have
+// identical square-reduction shapes.
+constexpr char kRmsNormReductionAttr[] = "zml.rms_norm_reduction";
+
+bool IsRmsNormReductionFusion(const HloInstruction& instr) {
+  if (instr.opcode() != HloOpcode::kFusion) {
+    return false;
+  }
+  const auto* fusion = Cast<const HloFusionInstruction>(&instr);
+  for (const HloInstruction* op :
+       fusion->fused_instructions_computation()->instructions()) {
+    if (op->opcode() != HloOpcode::kReduce) {
+      continue;
+    }
+    const auto& attributes = op->frontend_attributes().map();
+    auto marker = attributes.find(kRmsNormReductionAttr);
+    if (marker != attributes.end() && marker->second == "1") {
+      return true;
+    }
+  }
+  return false;
+}
 
 llvm::SmallSet<int64_t, 4> ComputeUnrollFactors(
     const HloInstruction& instr, int64_t default_unroll_factor,
@@ -77,7 +101,8 @@ bool NativeEmitterBackend::IsSupported(const HloInstruction& instr) {
     return false;
   }
   auto fusion = Cast<HloFusionInstruction>(&instr);
-  return fusion->fusion_kind() != HloInstruction::FusionKind::kCustom;
+  return fusion->fusion_kind() != HloInstruction::FusionKind::kCustom &&
+         !IsRmsNormReductionFusion(instr);
 }
 
 absl::StatusOr<std::vector<std::unique_ptr<BackendConfig>>>
@@ -114,6 +139,10 @@ NativeEmitterBackend::GetSupportedConfigs(const HloInstruction& instr) {
 
 absl::StatusOr<std::unique_ptr<BackendConfig>>
 NativeEmitterBackend::GetDefaultConfig(const HloInstruction& instr) {
+  if (IsRmsNormReductionFusion(instr)) {
+    return absl::NotFoundError(
+        "NativeEmitter is disabled for RMSNorm reduction fusions.");
+  }
   auto config = std::make_unique<BackendConfig>();
   NativeEmitterBackendConfig* native_emitter_config =
       config->mutable_native_emitter();
@@ -138,6 +167,10 @@ absl::Status NativeEmitterBackend::ApplyConfig(HloInstruction& instr,
                                                const BackendConfig& config) {
   if (!config.has_native_emitter()) {
     return absl::InvalidArgumentError("Expected NativeEmitterBackendConfig.");
+  }
+  if (IsRmsNormReductionFusion(instr)) {
+    return absl::FailedPreconditionError(
+        "NativeEmitter is disabled for marked RMSNorm reduction fusions.");
   }
   const NativeEmitterBackendConfig& native_emitter_fusion_config =
       config.native_emitter();

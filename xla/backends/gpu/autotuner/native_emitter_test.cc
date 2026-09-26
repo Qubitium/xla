@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/backends/gpu/autotuner/native_emitter.h"
 
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <gmock/gmock.h>
@@ -23,6 +24,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_replace.h"
 #include "absl/strings/substitute.h"
 #include "xla/backends/autotuner/codegen_backend.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -67,6 +69,45 @@ ENTRY %entry_computation (p0: f32[32,4096,2048]) -> f32[32,2048] {
   %p0 = f32[32,4096,2048]{2,1,0} parameter(0)
   ROOT %reduce_fusion = f32[32,2048]{1,0} fusion(%p0), kind=kInput,
     calls=%fused_reduce.clone
+})";
+
+const char kDeepSeekV41RmsNormHlo[] = R"(
+HloModule deepseek_v41_rmsnorm
+
+%add (lhs: f32[], rhs: f32[]) -> f32[] {
+  %lhs = f32[] parameter(0)
+  %rhs = f32[] parameter(1)
+  ROOT %sum = f32[] add(%lhs, %rhs)
+}
+
+%rmsnorm (hidden: bf16[1,1,5120], weight: bf16[5120]) -> bf16[1,1,5120] {
+  %hidden = bf16[1,1,5120]{2,1,0} parameter(0)
+  %weight = bf16[5120]{0} parameter(1)
+  %hidden_f32 = f32[1,1,5120]{2,1,0} convert(%hidden)
+  %square = f32[1,1,5120]{2,1,0} multiply(%hidden_f32, %hidden_f32)
+  %zero = f32[] constant(0)
+  %sum = f32[1,1]{1,0} reduce(%square, %zero), dimensions={2}, to_apply=%add,
+    frontend_attributes={zml.rms_norm_reduction="1"}
+  %mean_scale = f32[] constant(0.0001953125)
+  %mean_scale_b = f32[1,1]{1,0} broadcast(%mean_scale), dimensions={}
+  %mean = f32[1,1]{1,0} multiply(%sum, %mean_scale_b)
+  %eps = f32[] constant(1e-20)
+  %eps_b = f32[1,1]{1,0} broadcast(%eps), dimensions={}
+  %variance_eps = f32[1,1]{1,0} add(%mean, %eps_b)
+  %inv_rms = f32[1,1]{1,0} rsqrt(%variance_eps)
+  %inv_rms_b = f32[1,1,5120]{2,1,0} broadcast(%inv_rms), dimensions={0,1}
+  %normalized = f32[1,1,5120]{2,1,0} multiply(%hidden_f32, %inv_rms_b)
+  %weight_f32 = f32[5120]{0} convert(%weight)
+  %weight_b = f32[1,1,5120]{2,1,0} broadcast(%weight_f32), dimensions={2}
+  %weighted = f32[1,1,5120]{2,1,0} multiply(%normalized, %weight_b)
+  ROOT %out = bf16[1,1,5120]{2,1,0} convert(%weighted)
+}
+
+ENTRY %entry_computation (hidden: bf16[1,1,5120], weight: bf16[5120]) -> bf16[1,1,5120] {
+  %hidden = bf16[1,1,5120]{2,1,0} parameter(0)
+  %weight = bf16[5120]{0} parameter(1)
+  ROOT %fusion = bf16[1,1,5120]{2,1,0} fusion(%hidden, %weight),
+    kind=kInput, calls=%rmsnorm
 })";
 
 const char kAddKernelHlo[] = R"(
@@ -153,6 +194,36 @@ TEST_F(NativeEmitterBackendTest, GetSupportedConfigs) {
   ASSERT_EQ(configs.size(), 1);
   // Verify the returned config is a native emitter config.
   ASSERT_TRUE(configs[0]->has_native_emitter());
+}
+
+TEST_F(NativeEmitterBackendTest, RejectsDeepSeekV41RmsNorm) {
+  // DeepSeek V4.1 Flash production RMSNorm contract:
+  // BF16 [1,1,5120], hidden_size=5120, rms_norm_eps=1e-20.
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       ParseAndReturnVerifiedModule(kDeepSeekV41RmsNormHlo));
+  auto* fusion = module->entry_computation()->root_instruction();
+
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(*fusion));
+  EXPECT_TRUE(configs.empty());
+  EXPECT_THAT(backend_.GetDefaultConfig(*fusion),
+              absl_testing::StatusIs(absl::StatusCode::kNotFound));
+
+  BackendConfig stale_config;
+  stale_config.mutable_native_emitter();
+  EXPECT_THAT(backend_.ApplyConfig(*fusion, stale_config),
+              absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition));
+}
+
+TEST_F(NativeEmitterBackendTest, AllowsIdenticalUntaggedRmsNormGraph) {
+  std::string untagged = absl::StrReplaceAll(
+      kDeepSeekV41RmsNormHlo,
+      {{",\n    frontend_attributes={zml.rms_norm_reduction=\"1\"}", ""}});
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(untagged));
+  auto* fusion = module->entry_computation()->root_instruction();
+  ASSERT_OK_AND_ASSIGN(auto configs, backend_.GetSupportedConfigs(*fusion));
+  ASSERT_EQ(configs.size(), 1);
+  EXPECT_TRUE(configs[0]->has_native_emitter());
 }
 
 TEST_F(NativeEmitterBackendTest, GetDefaultConfigForLoopFusion) {
