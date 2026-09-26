@@ -130,6 +130,136 @@ ENTRY %entry_computation (hidden: bf16[1,1,5120]) -> f32[1,1] {
     kind=kInput, calls=%plain_reduce
 })";
 
+const char kSquared5120ReductionHlo[] = R"(
+HloModule squared_5120_reduce
+
+%add (lhs: f32[], rhs: f32[]) -> f32[] {
+  %lhs = f32[] parameter(0)
+  %rhs = f32[] parameter(1)
+  ROOT %sum = f32[] add(%lhs, %rhs)
+}
+
+%squared_reduce (hidden: bf16[1,1,5120]) -> f32[1,1] {
+  %hidden = bf16[1,1,5120]{2,1,0} parameter(0)
+  %hidden_f32 = f32[1,1,5120]{2,1,0} convert(%hidden)
+  %square = f32[1,1,5120]{2,1,0} multiply(%hidden_f32, %hidden_f32)
+  %zero = f32[] constant(0)
+  ROOT %sum = f32[1,1]{1,0} reduce(%square, %zero),
+    dimensions={2}, to_apply=%add
+}
+
+ENTRY %entry_computation (hidden: bf16[1,1,5120]) -> f32[1,1] {
+  %hidden = bf16[1,1,5120]{2,1,0} parameter(0)
+  ROOT %fusion = f32[1,1]{1,0} fusion(%hidden),
+    kind=kInput, calls=%squared_reduce
+})";
+
+const char kTupleSplitRmsNormHlo[] = R"(
+HloModule tuple_split_rmsnorm
+
+%add (lhs: f32[], rhs: f32[]) -> f32[] {
+  %lhs = f32[] parameter(0)
+  %rhs = f32[] parameter(1)
+  ROOT %sum = f32[] add(%lhs, %rhs)
+}
+
+%square_sum (hidden: bf16[1,1,5120]) -> (f32[1,1], bf16[1,1,5120]) {
+  %hidden = bf16[1,1,5120]{2,1,0} parameter(0)
+  %hidden_f32 = f32[1,1,5120]{2,1,0} convert(%hidden)
+  %square = f32[1,1,5120]{2,1,0} multiply(%hidden_f32, %hidden_f32)
+  %zero = f32[] constant(0)
+  %sum = f32[1,1]{1,0} reduce(%square, %zero), dimensions={2}, to_apply=%add
+  ROOT %tuple = (f32[1,1]{1,0}, bf16[1,1,5120]{2,1,0}) tuple(%sum, %hidden)
+}
+
+%normalize (hidden: bf16[1,1,5120], sum: f32[1,1]) -> f32[1,1,5120] {
+  %hidden = bf16[1,1,5120]{2,1,0} parameter(0)
+  %sum = f32[1,1]{1,0} parameter(1)
+  %scale = f32[] constant(0.0001953125)
+  %scale_b = f32[1,1]{1,0} broadcast(%scale), dimensions={}
+  %mean = f32[1,1]{1,0} multiply(%sum, %scale_b)
+  %eps = f32[] constant(1e-20)
+  %eps_b = f32[1,1]{1,0} broadcast(%eps), dimensions={}
+  %variance_eps = f32[1,1]{1,0} add(%mean, %eps_b)
+  %inv_rms = f32[1,1]{1,0} rsqrt(%variance_eps)
+  %inv_rms_b = f32[1,1,5120]{2,1,0} broadcast(%inv_rms), dimensions={0,1}
+  %hidden_f32 = f32[1,1,5120]{2,1,0} convert(%hidden)
+  ROOT %normalized = f32[1,1,5120]{2,1,0} multiply(%hidden_f32, %inv_rms_b)
+}
+
+ENTRY %entry_computation (hidden: bf16[1,1,5120]) -> f32[1,1,5120] {
+  %hidden = bf16[1,1,5120]{2,1,0} parameter(0)
+  %reduce_fusion = (f32[1,1]{1,0}, bf16[1,1,5120]{2,1,0}) fusion(%hidden),
+    kind=kInput, calls=%square_sum
+  %sum = f32[1,1]{1,0} get-tuple-element(%reduce_fusion), index=0
+  ROOT %norm_fusion = f32[1,1,5120]{2,1,0} fusion(%hidden, %sum),
+    kind=kLoop, calls=%normalize
+})";
+
+const char kL2NormHlo[] = R"(
+HloModule l2_norm
+
+%add (lhs: f32[], rhs: f32[]) -> f32[] {
+  %lhs = f32[] parameter(0)
+  %rhs = f32[] parameter(1)
+  ROOT %sum = f32[] add(%lhs, %rhs)
+}
+
+%normalize (hidden: bf16[1,1,5120]) -> f32[1,1,5120] {
+  %hidden = bf16[1,1,5120]{2,1,0} parameter(0)
+  %hidden_f32 = f32[1,1,5120]{2,1,0} convert(%hidden)
+  %square = f32[1,1,5120]{2,1,0} multiply(%hidden_f32, %hidden_f32)
+  %zero = f32[] constant(0)
+  %sum = f32[1,1]{1,0} reduce(%square, %zero), dimensions={2}, to_apply=%add
+  %eps = f32[] constant(1e-20)
+  %eps_b = f32[1,1]{1,0} broadcast(%eps), dimensions={}
+  %sum_eps = f32[1,1]{1,0} add(%sum, %eps_b)
+  %inv_norm = f32[1,1]{1,0} rsqrt(%sum_eps)
+  %inv_norm_b = f32[1,1,5120]{2,1,0} broadcast(%inv_norm), dimensions={0,1}
+  ROOT %normalized = f32[1,1,5120]{2,1,0} multiply(%hidden_f32, %inv_norm_b)
+}
+
+ENTRY %entry_computation (hidden: bf16[1,1,5120]) -> f32[1,1,5120] {
+  %hidden = bf16[1,1,5120]{2,1,0} parameter(0)
+  ROOT %norm_fusion = f32[1,1,5120]{2,1,0} fusion(%hidden),
+    kind=kInput, calls=%normalize
+})";
+
+const char kCenteredVarianceHlo[] = R"(
+HloModule centered_variance
+
+%add (lhs: f32[], rhs: f32[]) -> f32[] {
+  %lhs = f32[] parameter(0)
+  %rhs = f32[] parameter(1)
+  ROOT %sum = f32[] add(%lhs, %rhs)
+}
+
+%normalize (hidden: f32[1,1,5120], center: f32[1,1]) -> f32[1,1,5120] {
+  %hidden = f32[1,1,5120]{2,1,0} parameter(0)
+  %center = f32[1,1]{1,0} parameter(1)
+  %center_b = f32[1,1,5120]{2,1,0} broadcast(%center), dimensions={0,1}
+  %centered = f32[1,1,5120]{2,1,0} subtract(%hidden, %center_b)
+  %square = f32[1,1,5120]{2,1,0} multiply(%centered, %centered)
+  %zero = f32[] constant(0)
+  %sum = f32[1,1]{1,0} reduce(%square, %zero), dimensions={2}, to_apply=%add
+  %scale = f32[] constant(0.0001953125)
+  %scale_b = f32[1,1]{1,0} broadcast(%scale), dimensions={}
+  %variance = f32[1,1]{1,0} multiply(%sum, %scale_b)
+  %eps = f32[] constant(1e-5)
+  %eps_b = f32[1,1]{1,0} broadcast(%eps), dimensions={}
+  %variance_eps = f32[1,1]{1,0} add(%variance, %eps_b)
+  %inv_std = f32[1,1]{1,0} rsqrt(%variance_eps)
+  %inv_std_b = f32[1,1,5120]{2,1,0} broadcast(%inv_std), dimensions={0,1}
+  ROOT %normalized = f32[1,1,5120]{2,1,0} multiply(%centered, %inv_std_b)
+}
+
+ENTRY %entry_computation (hidden: f32[1,1,5120], center: f32[1,1]) -> f32[1,1,5120] {
+  %hidden = f32[1,1,5120]{2,1,0} parameter(0)
+  %center = f32[1,1]{1,0} parameter(1)
+  ROOT %norm_fusion = f32[1,1,5120]{2,1,0} fusion(%hidden, %center),
+    kind=kInput, calls=%normalize
+})";
+
 const char kAddKernelHlo[] = R"(
 HloModule m
 
@@ -219,13 +349,12 @@ TEST_F(NativeEmitterBackendTest, GetSupportedConfigs) {
 TEST_F(NativeEmitterBackendTest, RejectsDeepSeekV41RmsNorm) {
   // DeepSeek V4.1 Flash production RMSNorm contract:
   // BF16 [1,1,5120], hidden_size=5120, rms_norm_eps=1e-20.
-  ASSERT_OK_AND_ASSIGN(
-      auto module, ParseAndReturnVerifiedModule(kDeepSeekV41RmsNormHlo));
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       ParseAndReturnVerifiedModule(kDeepSeekV41RmsNormHlo));
   auto* fusion = module->entry_computation()->root_instruction();
 
-  ASSERT_OK_AND_ASSIGN(
-      std::vector<std::unique_ptr<BackendConfig>> configs,
-      backend_.GetSupportedConfigs(*fusion));
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(*fusion));
   EXPECT_TRUE(configs.empty());
   EXPECT_THAT(backend_.GetDefaultConfig(*fusion),
               absl_testing::StatusIs(absl::StatusCode::kNotFound));
@@ -233,13 +362,57 @@ TEST_F(NativeEmitterBackendTest, RejectsDeepSeekV41RmsNorm) {
 
 TEST_F(NativeEmitterBackendTest, AllowsNonRmsNorm5120Reduction) {
   // Same production-sized BF16 geometry, but no x*x square.
-  ASSERT_OK_AND_ASSIGN(
-      auto module, ParseAndReturnVerifiedModule(kPlain5120ReductionHlo));
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       ParseAndReturnVerifiedModule(kPlain5120ReductionHlo));
   auto* fusion = module->entry_computation()->root_instruction();
 
-  ASSERT_OK_AND_ASSIGN(
-      std::vector<std::unique_ptr<BackendConfig>> configs,
-      backend_.GetSupportedConfigs(*fusion));
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(*fusion));
+  ASSERT_EQ(configs.size(), 1);
+  EXPECT_TRUE(configs[0]->has_native_emitter());
+}
+
+TEST_F(NativeEmitterBackendTest, AllowsNonRmsNormSquareReduction) {
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       ParseAndReturnVerifiedModule(kSquared5120ReductionHlo));
+  auto* fusion = module->entry_computation()->root_instruction();
+
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(*fusion));
+  ASSERT_EQ(configs.size(), 1);
+  EXPECT_TRUE(configs[0]->has_native_emitter());
+  ASSERT_OK_AND_ASSIGN(auto default_config, backend_.GetDefaultConfig(*fusion));
+  EXPECT_TRUE(default_config->has_native_emitter());
+}
+
+TEST_F(NativeEmitterBackendTest, RejectsTupleSplitRmsNormReduction) {
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       ParseAndReturnVerifiedModule(kTupleSplitRmsNormHlo));
+  auto* fusion =
+      module->entry_computation()->GetInstructionWithName("reduce_fusion");
+  ASSERT_NE(fusion, nullptr);
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(*fusion));
+  EXPECT_TRUE(configs.empty());
+  EXPECT_THAT(backend_.GetDefaultConfig(*fusion),
+              absl_testing::StatusIs(absl::StatusCode::kNotFound));
+}
+
+TEST_F(NativeEmitterBackendTest, AllowsL2Norm) {
+  ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(kL2NormHlo));
+  auto* fusion = module->entry_computation()->root_instruction();
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(*fusion));
+  ASSERT_EQ(configs.size(), 1);
+  EXPECT_TRUE(configs[0]->has_native_emitter());
+}
+
+TEST_F(NativeEmitterBackendTest, AllowsCenteredVariance) {
+  ASSERT_OK_AND_ASSIGN(auto module,
+                       ParseAndReturnVerifiedModule(kCenteredVarianceHlo));
+  auto* fusion = module->entry_computation()->root_instruction();
+  ASSERT_OK_AND_ASSIGN(std::vector<std::unique_ptr<BackendConfig>> configs,
+                       backend_.GetSupportedConfigs(*fusion));
   ASSERT_EQ(configs.size(), 1);
   EXPECT_TRUE(configs[0]->has_native_emitter());
 }
