@@ -69,6 +69,67 @@ ENTRY %entry_computation (p0: f32[32,4096,2048]) -> f32[32,2048] {
     calls=%fused_reduce.clone
 })";
 
+const char kDeepSeekV41RmsNormHlo[] = R"(
+HloModule deepseek_v41_rmsnorm
+
+%add (lhs: f32[], rhs: f32[]) -> f32[] {
+  %lhs = f32[] parameter(0)
+  %rhs = f32[] parameter(1)
+  ROOT %sum = f32[] add(%lhs, %rhs)
+}
+
+%rmsnorm (hidden: bf16[1,1,5120], weight: bf16[5120]) -> bf16[1,1,5120] {
+  %hidden = bf16[1,1,5120]{2,1,0} parameter(0)
+  %weight = bf16[5120]{0} parameter(1)
+  %hidden_f32 = f32[1,1,5120]{2,1,0} convert(%hidden)
+  %square = f32[1,1,5120]{2,1,0} multiply(%hidden_f32, %hidden_f32)
+  %zero = f32[] constant(0)
+  %sum = f32[1,1]{1,0} reduce(%square, %zero), dimensions={2}, to_apply=%add
+  %mean_scale = f32[] constant(0.0001953125)
+  %mean_scale_b = f32[1,1]{1,0} broadcast(%mean_scale), dimensions={}
+  %mean = f32[1,1]{1,0} multiply(%sum, %mean_scale_b)
+  %eps = f32[] constant(1e-20)
+  %eps_b = f32[1,1]{1,0} broadcast(%eps), dimensions={}
+  %variance_eps = f32[1,1]{1,0} add(%mean, %eps_b)
+  %inv_rms = f32[1,1]{1,0} rsqrt(%variance_eps)
+  %inv_rms_b = f32[1,1,5120]{2,1,0} broadcast(%inv_rms), dimensions={0,1}
+  %normalized = f32[1,1,5120]{2,1,0} multiply(%hidden_f32, %inv_rms_b)
+  %weight_f32 = f32[5120]{0} convert(%weight)
+  %weight_b = f32[1,1,5120]{2,1,0} broadcast(%weight_f32), dimensions={2}
+  %weighted = f32[1,1,5120]{2,1,0} multiply(%normalized, %weight_b)
+  ROOT %out = bf16[1,1,5120]{2,1,0} convert(%weighted)
+}
+
+ENTRY %entry_computation (hidden: bf16[1,1,5120], weight: bf16[5120]) -> bf16[1,1,5120] {
+  %hidden = bf16[1,1,5120]{2,1,0} parameter(0)
+  %weight = bf16[5120]{0} parameter(1)
+  ROOT %fusion = bf16[1,1,5120]{2,1,0} fusion(%hidden, %weight),
+    kind=kInput, calls=%rmsnorm
+})";
+
+const char kPlain5120ReductionHlo[] = R"(
+HloModule plain_5120_reduce
+
+%add (lhs: f32[], rhs: f32[]) -> f32[] {
+  %lhs = f32[] parameter(0)
+  %rhs = f32[] parameter(1)
+  ROOT %sum = f32[] add(%lhs, %rhs)
+}
+
+%plain_reduce (hidden: bf16[1,1,5120]) -> f32[1,1] {
+  %hidden = bf16[1,1,5120]{2,1,0} parameter(0)
+  %hidden_f32 = f32[1,1,5120]{2,1,0} convert(%hidden)
+  %zero = f32[] constant(0)
+  ROOT %sum = f32[1,1]{1,0} reduce(%hidden_f32, %zero),
+    dimensions={2}, to_apply=%add
+}
+
+ENTRY %entry_computation (hidden: bf16[1,1,5120]) -> f32[1,1] {
+  %hidden = bf16[1,1,5120]{2,1,0} parameter(0)
+  ROOT %fusion = f32[1,1]{1,0} fusion(%hidden),
+    kind=kInput, calls=%plain_reduce
+})";
+
 const char kAddKernelHlo[] = R"(
 HloModule m
 
@@ -153,6 +214,34 @@ TEST_F(NativeEmitterBackendTest, GetSupportedConfigs) {
   ASSERT_EQ(configs.size(), 1);
   // Verify the returned config is a native emitter config.
   ASSERT_TRUE(configs[0]->has_native_emitter());
+}
+
+TEST_F(NativeEmitterBackendTest, RejectsDeepSeekV41RmsNorm) {
+  // DeepSeek V4.1 Flash production RMSNorm contract:
+  // BF16 [1,1,5120], hidden_size=5120, rms_norm_eps=1e-20.
+  ASSERT_OK_AND_ASSIGN(
+      auto module, ParseAndReturnVerifiedModule(kDeepSeekV41RmsNormHlo));
+  auto* fusion = module->entry_computation()->root_instruction();
+
+  ASSERT_OK_AND_ASSIGN(
+      std::vector<std::unique_ptr<BackendConfig>> configs,
+      backend_.GetSupportedConfigs(*fusion));
+  EXPECT_TRUE(configs.empty());
+  EXPECT_THAT(backend_.GetDefaultConfig(*fusion),
+              absl_testing::StatusIs(absl::StatusCode::kNotFound));
+}
+
+TEST_F(NativeEmitterBackendTest, AllowsNonRmsNorm5120Reduction) {
+  // Same production-sized BF16 geometry, but no x*x square.
+  ASSERT_OK_AND_ASSIGN(
+      auto module, ParseAndReturnVerifiedModule(kPlain5120ReductionHlo));
+  auto* fusion = module->entry_computation()->root_instruction();
+
+  ASSERT_OK_AND_ASSIGN(
+      std::vector<std::unique_ptr<BackendConfig>> configs,
+      backend_.GetSupportedConfigs(*fusion));
+  ASSERT_EQ(configs.size(), 1);
+  EXPECT_TRUE(configs[0]->has_native_emitter());
 }
 
 TEST_F(NativeEmitterBackendTest, GetDefaultConfigForLoopFusion) {
