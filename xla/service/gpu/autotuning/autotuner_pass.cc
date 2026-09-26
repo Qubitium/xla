@@ -100,6 +100,70 @@ AutotuneDecision AllowRegSpillsForGpuInstruction(
   return AutotuneDecision::Allow();
 }
 
+// RMSNorm can be split by fusion formation so the reduction fusion no longer
+// contains the rsqrt/scale consumers. Match the stable structural anchor:
+// activation -> F32 -> square -> reduce over the final hidden dimension.
+//
+// NativeEmitter and BlockLevelEmitter use different reduction trees. For this
+// pattern, keep NativeEmitter out of the candidate set so RMSNorm uses the
+// block-level path with the validated numerical behavior.
+bool IsRmsNormReductionFusion(const HloInstruction& instruction) {
+  if (instruction.opcode() != HloOpcode::kFusion) {
+    return false;
+  }
+
+  const auto* fusion = Cast<const HloFusionInstruction>(&instruction);
+  const HloComputation* fused_computation =
+      fusion->fused_instructions_computation();
+  if (fused_computation == nullptr) {
+    return false;
+  }
+
+  for (const HloInstruction* fused_instruction :
+       fused_computation->instructions()) {
+    if (fused_instruction->opcode() != HloOpcode::kReduce ||
+        fused_instruction->operand_count() < 1 ||
+        fused_instruction->shape().element_type() != PrimitiveType::F32 ||
+        fused_instruction->dimensions().empty() ||
+        fused_instruction->operand(0)->opcode() != HloOpcode::kMultiply) {
+      continue;
+    }
+
+    const HloInstruction* square = fused_instruction->operand(0);
+    if (square->operand_count() != 2 ||
+        square->operand(0) != square->operand(1)) {
+      continue;
+    }
+
+    const HloInstruction* square_input = square->operand(0);
+    const HloInstruction* activation = square_input;
+    if (square_input->opcode() == HloOpcode::kConvert) {
+      if (square_input->shape().element_type() != PrimitiveType::F32 ||
+          square_input->operand_count() != 1) {
+        continue;
+      }
+      activation = square_input->operand(0);
+    }
+
+    if (!activation->shape().IsArray() ||
+        activation->shape().dimensions_size() < 1 ||
+        (activation->shape().element_type() != PrimitiveType::F16 &&
+         activation->shape().element_type() != PrimitiveType::BF16 &&
+         activation->shape().element_type() != PrimitiveType::F32) ||
+        square_input->shape().element_type() != PrimitiveType::F32 ||
+        square_input->shape().dimensions_size() !=
+            activation->shape().dimensions_size()) {
+      continue;
+    }
+
+    const int64_t hidden_axis = activation->shape().dimensions_size() - 1;
+    if (absl::c_linear_search(fused_instruction->dimensions(), hidden_axis)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 AutotuneDecision ShouldAutotuneCustomCall(bool do_not_autotune_cublas,
                                           bool do_not_autotune_cudnn,
                                           const HloInstruction& instruction) {
@@ -247,6 +311,16 @@ CodegenOrchestrator::Options GetCodegenOrchestratorOptions(
     const DebugOptions& debug_options) {
   CodegenOrchestrator::Options options;
   options.exclude_cublas_config = !debug_options.xla_gpu_cublas_fallback();
+  options.allow_backend_fn =
+      [](const HloInstruction& instruction, autotuner::Backend backend) {
+        if (backend == autotuner::Backend::NATIVE_EMITTER &&
+            IsRmsNormReductionFusion(instruction)) {
+          VLOG(2) << "Disallowing NativeEmitter for RMSNorm reduction HLO: "
+                  << instruction.name();
+          return false;
+        }
+        return true;
+      };
   if (!debug_options.xla_gpu_fail_ptx_compilation_on_register_spilling()) {
     options.allow_reg_spills_fn = [](const HloInstruction& instr) {
       return static_cast<bool>(AllowRegSpillsForGpuInstruction(instr));
